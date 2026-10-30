@@ -8,7 +8,9 @@
   body { font: 16px/1.4 system-ui, sans-serif; max-width: 40rem; margin: 1rem auto; padding: 0 1rem; }
   button, input { font: inherit; padding: .5rem .8rem; margin: .2rem 0; }
   pre { background: #eee; padding: .6rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
-  #code { font-size: 1.6rem; font-weight: bold; letter-spacing: .1em; }
+  #code, #link { width: 100%; box-sizing: border-box; }
+  #code { font-size: 1.2rem; font-weight: bold; }
+  textarea { font: 13px/1.3 monospace; }
   @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } pre { background: #222; } }
 </style>
 </head>
@@ -20,11 +22,15 @@
 <span> or </span>
 <input id="join-code" placeholder="room code" size="12" autocapitalize="off" autocomplete="off">
 <button id="join">Join</button>
-<p id="code"></p>
-<p id="link"></p>
+<div id="room" hidden>
+  <p>Room code (tap it to select, or use the buttons):</p>
+  <input id="code" readonly size="26" onclick="this.select()">
+  <p><button id="copy-code">Copy code</button> <button id="copy-link">Copy link</button> <button id="share">Share link</button></p>
+  <input id="link" readonly size="40" onclick="this.select()">
+</div>
 <pre id="log"></pre>
-<pre id="result" hidden></pre>
-<button id="copy" hidden>Copy result</button>
+<textarea id="result" readonly rows="14" style="width:100%" hidden onclick="this.select()"></textarea>
+<p><button id="copy" hidden>Copy result</button></p>
 
 <script type="module">
 import { Peer } from 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/+esm';
@@ -45,7 +51,17 @@ const q = new URLSearchParams(location.search).get('room');
 if (q) $('join-code').value = q;
 $('host').onclick = () => start('host');
 $('join').onclick = () => start('guest');
-$('copy').onclick = () => navigator.clipboard?.writeText($('result').textContent);
+async function copyText(text, el) {
+  try { await navigator.clipboard.writeText(text); log('Copied.'); return; } catch {}
+  try { el.focus(); el.select(); el.setSelectionRange(0, 1e6); if (document.execCommand('copy')) { log('Copied.'); return; } } catch {}
+  log('Copy was blocked. Tap the box above to select it and copy by hand.');
+}
+$('copy').onclick = () => copyText($('result').value, $('result'));
+$('copy-code').onclick = () => copyText($('code').value, $('code'));
+$('copy-link').onclick = () => copyText($('link').value, $('link'));
+$('share').onclick = () => navigator.share ? navigator.share({ title: 'WebRTC test', url: $('link').value }).catch(() => {}) : copyText($('link').value, $('link'));
+window.addEventListener('error', (e) => log('Page error:', e.message));
+window.addEventListener('unhandledrejection', (e) => log('Page error:', e.reason?.message ?? e.reason));
 
 // Which path the media took: host (same network), srflx/prflx (direct through NAT), relay (TURN).
 async function pathType(pc) {
@@ -68,13 +84,18 @@ function start(role) {
 // ---- host: pings both channels, sends 20 Hz snapshots, counts the guest's 60 Hz input ----
 function host(t0) {
   const code = 'sf-nettest-' + rand() + rand();
+  const url = location.origin + location.pathname + '?room=' + code;
+  $('room').hidden = false;
+  $('code').value = code;
+  $('link').value = url;
+  log('Room code ready. Connecting to the PeerJS server (needed before anyone can join) ...');
   const peer = new Peer(code);
+  const brokerTimer = setTimeout(() => log('Still no answer from the PeerJS server after 15 s. If this stays, this network blocks it: try another network or Wi-Fi/mobile data.'), 15000);
   peer.on('error', (e) => log('ERROR', e.type, e.message));
+  peer.on('disconnected', () => log('Lost the PeerJS server. Reload the page and press Host again.'));
   peer.on('open', () => {
-    $('code').textContent = code;
-    const url = location.origin + location.pathname + '?room=' + code;
-    $('link').textContent = url;
-    log('Waiting for the other player. Send them the code or the link.');
+    clearTimeout(brokerTimer);
+    log('Server reached. Waiting for the other player. Send them the code or the link.');
   });
   peer.on('connection', (conn) => {
     const pc = conn.peerConnection, orig = pc.ondatachannel;
@@ -118,7 +139,7 @@ function host(t0) {
       out.guestToHost = { sent, received: got, lossPct: round(sent ? (1 - got / sent) * 100 : null) };
       window.__result = out;
       $('result').hidden = false; $('copy').hidden = false;
-      $('result').textContent = JSON.stringify(out, null, 2);
+      $('result').value = JSON.stringify(out, null, 2);
       log('Done. Copy the result below and send it back.');
     }
   });
@@ -129,8 +150,10 @@ function guest(t0) {
   const code = $('join-code').value.trim();
   if (!code) { log('Enter a room code.'); $('host').disabled = $('join').disabled = false; return; }
   const peer = new Peer();
-  peer.on('error', (e) => log('ERROR', e.type, e.message));
+  log('Connecting to the PeerJS server ...');
+  peer.on('error', (e) => log('ERROR', e.type, e.message, e.type === 'peer-unavailable' ? '(wrong code, or the host has not reached the server yet)' : ''));
   peer.on('open', () => {
+    log('Server reached. Contacting the host ...');
     const conn = peer.connect(code, { serialization: 'json', reliable: true });
     let fast = null, relOpen = false, inN = 0, timer = null;
     const seen = new Set();
@@ -163,7 +186,7 @@ function guest(t0) {
         window.__result = out;
         conn.send({ k: 'summary', inputSent: inN, hostToGuest: out.hostToGuest, path });
         $('result').hidden = false; $('copy').hidden = false;
-        $('result').textContent = JSON.stringify(out, null, 2);
+        $('result').value = JSON.stringify(out, null, 2);
         log('Done. The host page has the full result.');
       }
     });
